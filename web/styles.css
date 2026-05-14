@@ -67,6 +67,42 @@ body {
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 
+/* ---------- BETA strip ---------- */
+.beta-bar {
+  background: #fef3c7;
+  border-bottom: 1px solid #fbbf24;
+  color: #78350f;
+  font-size: 0.83rem;
+  padding: 0.5rem 1.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+  justify-content: center;
+  flex-wrap: wrap;
+  text-align: center;
+  line-height: 1.4;
+}
+.beta-pill {
+  background: #d97706;
+  color: #fff;
+  font-weight: 700;
+  font-size: 0.7rem;
+  letter-spacing: 0.08em;
+  padding: 0.12rem 0.55rem;
+  border-radius: 999px;
+  flex: 0 0 auto;
+}
+.beta-bar a { color: #78350f; text-decoration: underline; }
+.beta-bar a:hover { color: #451a03; }
+
+html[data-theme="dark"] .beta-bar {
+  background: #2a1a05;
+  border-color: #92400e;
+  color: #fbbf24;
+}
+html[data-theme="dark"] .beta-bar a { color: #fcd34d; }
+html[data-theme="dark"] .beta-bar a:hover { color: #fef3c7; }
+
 /* ---------- Header ---------- */
 .app-header {
   background: var(--bg-card);
