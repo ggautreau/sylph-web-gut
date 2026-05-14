@@ -1,0 +1,325 @@
+// In-browser sylph profile.
+//
+// Pipeline:
+//   1. fetch /db/gut_mini.syldb (~6 MB) and /db/lineage.json once
+//   2. user picks a FASTQ; we gunzip if needed and trim to the first N reads
+//   3. pass the uncompressed-trimmed bytes to Rust → Profiler.profile()
+//   4. parse the TSV it returns, join against the lineage map, render a table
+
+import { sylphWorkerRpc } from "./sylph-worker-rpc.js";
+
+const $ = (id) => document.getElementById(id);
+const els = {
+  drop: $("drop"), file: $("file"), dropLabel: $("dropLabel"),
+  maxReads: $("maxReads"), maxReadsSlider: $("maxReadsSlider"), run: $("run"),
+  progress: $("progress"), bar: $("bar"),
+  step: $("step"), bytesIn: $("bytesIn"), reads: $("reads"), elapsed: $("elapsed"),
+  error: $("error"), results: $("results"), resultsBody: $("resultsBody"),
+  dbInfo: $("dbInfo"), memHint: $("memHint"),
+  dbSelect: $("dbSelect"), loadDb: $("loadDb"),
+};
+
+const READS_MIN = 10_000;
+const READS_MAX = 3_000_000;
+const clampReads = (v) => Math.max(READS_MIN, Math.min(READS_MAX, Math.floor(Number(v) || 0)));
+
+let selectedFile = null;
+let rpc = sylphWorkerRpc();
+let dbMeta = null;
+let lineage = {};
+let wasmReady = false;
+
+(async () => {
+  try {
+    await rpc.init();
+    wasmReady = true;
+  } catch (e) {
+    showError(`WASM init failed: ${e.message ?? e}`);
+    console.error(e);
+  }
+})();
+
+// ---- database loading (user-triggered, can be ~430 MB) -------------------------
+
+els.loadDb.addEventListener("click", loadDatabase);
+
+async function loadDatabase() {
+  els.loadDb.disabled = true;
+  els.error.textContent = "";
+  const url = els.dbSelect.value;
+  const t0 = performance.now();
+  els.dbInfo.textContent = `Loading ${url}…`;
+
+  try {
+    while (!wasmReady) await new Promise(r => setTimeout(r, 50));
+
+    // Stream the response so we can show download progress.
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const total = Number(resp.headers.get("content-length") || 0);
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let received = 0;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      if (total > 0) {
+        const pct = (received / total * 100).toFixed(1);
+        els.dbInfo.textContent =
+          `Loading ${url} — ${fmtBytes(received)} / ${fmtBytes(total)} (${pct}%)`;
+      } else {
+        els.dbInfo.textContent = `Loading ${url} — ${fmtBytes(received)}`;
+      }
+    }
+    const dbBytes = new Uint8Array(received);
+    let off = 0;
+    for (const c of chunks) { dbBytes.set(c, off); off += c.length; }
+
+    // Lineage is small — fetch in parallel? simpler: serial after.
+    const lineageResp = await fetch("./db/lineage.json");
+    if (!lineageResp.ok) throw new Error(`lineage HTTP ${lineageResp.status}`);
+    lineage = await lineageResp.json();
+
+    els.dbInfo.textContent = `Decoding database in WASM worker…`;
+    dbMeta = await rpc.loadDb(dbBytes);
+    const dt = ((performance.now() - t0) / 1000).toFixed(1);
+    els.dbInfo.textContent =
+      `Database ready: ${dbMeta.database_size} genomes, k=${dbMeta.k}, c=${dbMeta.c} ` +
+      `(${fmtBytes(dbMeta.bytes)}, loaded in ${dt} s).`;
+    if (selectedFile) els.run.disabled = false;
+  } catch (e) {
+    els.dbInfo.textContent = "";
+    showError(`Failed to load database: ${e.message ?? e}`);
+    console.error(e);
+  } finally {
+    els.loadDb.disabled = false;
+  }
+}
+
+// ---- file selection -------------------------------------------------------------
+
+["dragenter", "dragover"].forEach(ev =>
+  els.drop.addEventListener(ev, e => { e.preventDefault(); els.drop.classList.add("over"); })
+);
+["dragleave", "drop"].forEach(ev =>
+  els.drop.addEventListener(ev, e => { e.preventDefault(); els.drop.classList.remove("over"); })
+);
+els.drop.addEventListener("drop", e => {
+  e.preventDefault();
+  if (e.dataTransfer.files.length) selectFile(e.dataTransfer.files[0]);
+});
+els.file.addEventListener("change", () => {
+  if (els.file.files.length) selectFile(els.file.files[0]);
+});
+
+function selectFile(f) {
+  selectedFile = f;
+  els.dropLabel.innerHTML = `<strong>${escapeHTML(f.name)}</strong> &mdash; ${fmtBytes(f.size)}`;
+  els.run.disabled = !dbMeta;
+  els.error.textContent = "";
+  els.results.classList.add("hide");
+}
+
+function updateMemHint(n) {
+  els.memHint.textContent = `~${(n / 1_000_000 * 360).toFixed(0)} MB peak browser memory at ${n.toLocaleString()} reads.`;
+}
+
+els.maxReadsSlider.addEventListener("input", () => {
+  const v = Number(els.maxReadsSlider.value);
+  els.maxReads.value = String(v);
+  updateMemHint(v);
+});
+els.maxReads.addEventListener("input", () => {
+  const raw = Number(els.maxReads.value);
+  if (!Number.isFinite(raw)) return;
+  els.maxReadsSlider.value = String(Math.max(READS_MIN, Math.min(READS_MAX, raw)));
+  updateMemHint(raw > 0 ? raw : 1);
+});
+els.maxReads.addEventListener("change", () => {
+  const v = clampReads(els.maxReads.value);
+  els.maxReads.value = String(v);
+  els.maxReadsSlider.value = String(v);
+  updateMemHint(v);
+});
+
+// ---- run -----------------------------------------------------------------------
+
+els.run.addEventListener("click", run);
+
+async function run() {
+  if (!selectedFile || !dbMeta) return;
+  els.error.textContent = "";
+  els.results.classList.add("hide");
+  els.progress.classList.remove("hide");
+  els.run.disabled = true;
+
+  const maxReads = clampReads(els.maxReads.value || 1_000_000);
+  const t0 = performance.now();
+  setStep("decompressing + trimming to first N reads…");
+
+  try {
+    const trimmed = await readAndTrim(selectedFile, maxReads, (bytesIn, reads, totalBytes) => {
+      const pct = totalBytes > 0 ? Math.min(100, (bytesIn / totalBytes) * 100) : 0;
+      paintProgress(pct, bytesIn, totalBytes, reads, maxReads, t0);
+    });
+    paintProgress(100, trimmed.compressedBytesRead, selectedFile.size, trimmed.reads, maxReads, t0);
+
+    // Heartbeat while the worker computes — the main thread stays responsive
+    // and the user sees a moving counter rather than a frozen UI.
+    const wasmT0 = performance.now();
+    const tick = setInterval(() => {
+      const sec = ((performance.now() - wasmT0) / 1000).toFixed(1);
+      setStep(`sketching + profiling ${trimmed.reads.toLocaleString()} reads in WASM worker (${sec} s)`);
+      els.elapsed.textContent = `${((performance.now() - t0) / 1000).toFixed(1)} s`;
+    }, 250);
+    let tsv;
+    try {
+      ({ tsv } = await rpc.profile(trimmed.bytes, maxReads));
+    } finally {
+      clearInterval(tick);
+    }
+    renderResults(tsv);
+    setStep(`done in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+  } catch (e) {
+    showError(`${e.message ?? e}\n\nCheck DevTools console for details.`);
+    console.error(e);
+  } finally {
+    els.run.disabled = false;
+  }
+}
+
+// ---- streaming: gunzip + cut at first 4*N newlines -----------------------------
+
+async function readAndTrim(file, maxReads, onProgress) {
+  const isGz = await detectGzip(file);
+  const targetNewlines = maxReads * 4;
+  const totalBytes = file.size;
+
+  let compressedBytesRead = 0;
+  const tap = new TransformStream({
+    transform(chunk, controller) {
+      compressedBytesRead += chunk.length;
+      controller.enqueue(chunk);
+    },
+  });
+
+  let stream = file.stream().pipeThrough(tap);
+  if (isGz) stream = stream.pipeThrough(new DecompressionStream("gzip"));
+
+  // Accumulate decompressed bytes up to (4 * maxReads) newlines.
+  const reader = stream.getReader();
+  const parts = [];
+  let totalOut = 0;
+  let newlines = 0;
+  let lastReport = 0;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+
+    let cutoff = -1;
+    for (let i = 0; i < value.length; i++) {
+      if (value[i] === 0x0A) {
+        newlines++;
+        if (newlines === targetNewlines) {
+          cutoff = i + 1;
+          break;
+        }
+      }
+    }
+    if (cutoff >= 0) {
+      parts.push(value.subarray(0, cutoff));
+      totalOut += cutoff;
+      await reader.cancel();
+      break;
+    }
+    parts.push(value);
+    totalOut += value.length;
+
+    const now = performance.now();
+    if (now - lastReport > 100) {
+      onProgress(compressedBytesRead, Math.floor(newlines / 4), totalBytes);
+      lastReport = now;
+    }
+  }
+
+  // One big Uint8Array — easier on wasm-bindgen than many tiny chunks.
+  const bytes = new Uint8Array(totalOut);
+  let off = 0;
+  for (const p of parts) {
+    bytes.set(p, off);
+    off += p.length;
+  }
+  return { bytes, reads: Math.floor(newlines / 4), compressedBytesRead };
+}
+
+async function detectGzip(file) {
+  const head = new Uint8Array(await file.slice(0, 2).arrayBuffer());
+  return head.length === 2 && head[0] === 0x1f && head[1] === 0x8b;
+}
+
+// ---- output rendering ----------------------------------------------------------
+
+function renderResults(tsv) {
+  const lines = tsv.trim().split("\n");
+  if (lines.length < 2) {
+    els.resultsBody.innerHTML = `<tr><td colspan="6">No genomes passed the profiling threshold.</td></tr>`;
+    els.results.classList.remove("hide");
+    return;
+  }
+  const header = lines[0].split("\t");
+  const idx = (name) => header.indexOf(name);
+  const cols = {
+    relAbund: idx("Taxonomic_abundance"),
+    seqAbund: idx("Sequence_abundance"),
+    ani: idx("Adjusted_ANI"),
+    cov: idx("Eff_cov"),
+    genomeFile: idx("Genome_file"),
+  };
+
+  const rows = lines.slice(1).map((l) => l.split("\t"));
+  els.resultsBody.innerHTML = rows.map((r) => {
+    const gname = (r[cols.genomeFile] || "").split("/").pop();
+    const species = lineage[gname] || `(${gname})`;
+    return `
+      <tr>
+        <td class="num">${fmtPct(r[cols.relAbund])}</td>
+        <td class="num">${fmtPct(r[cols.seqAbund])}</td>
+        <td class="num">${r[cols.ani] ?? ""}</td>
+        <td class="num">${r[cols.cov] ?? ""}</td>
+        <td><code>${escapeHTML(gname)}</code></td>
+        <td>${escapeHTML(species)}</td>
+      </tr>`;
+  }).join("");
+  els.results.classList.remove("hide");
+}
+
+function fmtPct(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toFixed(2) + " %" : (v ?? "");
+}
+
+// ---- chrome ---------------------------------------------------------------------
+
+function setStep(s) { els.step.textContent = s; }
+function showError(s) { els.error.textContent = s; }
+function paintProgress(pct, bytesIn, totalBytes, reads, maxReads, t0) {
+  els.bar.style.width = pct.toFixed(1) + "%";
+  els.bytesIn.textContent = `${fmtBytes(bytesIn)} / ${fmtBytes(totalBytes)}`;
+  els.reads.textContent = `${reads.toLocaleString()} / ${maxReads.toLocaleString()}`;
+  els.elapsed.textContent = `${((performance.now() - t0) / 1000).toFixed(1)} s`;
+}
+
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return "—";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function escapeHTML(s) {
+  return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+}
