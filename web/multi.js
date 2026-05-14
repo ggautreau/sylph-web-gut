@@ -117,14 +117,14 @@ async function loadDatabase() {
 
 // ---- reads slider / number sync ---------------------------------------------
 //
-// 3M is the safe ceiling that keeps memory under the 4 GB wasm32 limit. We allow
-// up to 5M (slider max) so users can attempt it, but the slider track is split
-// 60% teal "safe" / 40% red "may crash" and we surface a warning past 3M.
+// 3M is the safe ceiling that keeps memory under the 4 GB wasm32 limit. The
+// slider covers 10k–5M and turns red past 3M. The number input has no upper
+// bound so users can attempt larger values manually — they take the risk.
 
 const READS_MIN = 10_000;
 const READS_SAFE = 3_000_000;
-const READS_MAX = 5_000_000;
-const clampReads = (v) => Math.max(READS_MIN, Math.min(READS_MAX, Math.floor(Number(v) || 0)));
+const SLIDER_MAX = 5_000_000;
+const clampReads = (v) => Math.max(READS_MIN, Math.floor(Number(v) || 0));
 const readsWarn = document.getElementById("readsWarn");
 
 function updateReadsState(v) {
@@ -140,7 +140,7 @@ els.maxReadsSlider.addEventListener("input", () => {
 els.maxReads.addEventListener("input", () => {
   const raw = Number(els.maxReads.value);
   if (!Number.isFinite(raw)) return;
-  els.maxReadsSlider.value = String(Math.max(READS_MIN, Math.min(READS_MAX, raw)));
+  els.maxReadsSlider.value = String(Math.max(READS_MIN, Math.min(SLIDER_MAX, raw)));
   updateReadsState(raw);
 });
 els.maxReads.addEventListener("change", () => {

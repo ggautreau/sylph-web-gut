@@ -21,8 +21,8 @@ const els = {
 
 const READS_MIN = 10_000;
 const READS_SAFE = 3_000_000;
-const READS_MAX = 5_000_000;
-const clampReads = (v) => Math.max(READS_MIN, Math.min(READS_MAX, Math.floor(Number(v) || 0)));
+const SLIDER_MAX = 5_000_000;
+const clampReads = (v) => Math.max(READS_MIN, Math.floor(Number(v) || 0));
 const readsWarn = document.getElementById("readsWarn");
 
 function updateReadsState(v) {
@@ -150,7 +150,7 @@ els.maxReadsSlider.addEventListener("input", () => {
 els.maxReads.addEventListener("input", () => {
   const raw = Number(els.maxReads.value);
   if (!Number.isFinite(raw)) return;
-  els.maxReadsSlider.value = String(Math.max(READS_MIN, Math.min(READS_MAX, raw)));
+  els.maxReadsSlider.value = String(Math.max(READS_MIN, Math.min(SLIDER_MAX, raw)));
   updateMemHint(raw > 0 ? raw : 1);
   updateReadsState(raw);
 });
