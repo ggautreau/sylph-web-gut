@@ -356,6 +356,28 @@ html[data-theme="dark"] .ok { border-color: rgba(42, 138, 85, 0.4); }
 
 .hide { display: none !important; }
 
+/* ---------- Privacy info banner ---------- */
+.privacy-notice {
+  background: var(--bg-info);
+  border: 1px solid rgba(0, 163, 166, 0.3);
+  color: var(--ink);
+  border-radius: var(--radius-md);
+  padding: 0.8rem 1rem;
+  font-size: 0.9rem;
+  margin-bottom: 0.75rem;
+  display: flex;
+  gap: 0.65rem;
+  align-items: flex-start;
+  line-height: 1.5;
+}
+.privacy-notice .privacy-icon {
+  flex: 0 0 auto;
+  color: var(--accent);
+  margin-top: 1px;
+}
+.privacy-notice strong { color: var(--ink); font-weight: 600; }
+html[data-theme="dark"] .privacy-notice { border-color: rgba(0, 163, 166, 0.45); }
+
 /* ---------- Notice / warning banner ---------- */
 .notice {
   background: #fff8e6;
