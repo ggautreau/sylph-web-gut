@@ -20,8 +20,16 @@ const els = {
 };
 
 const READS_MIN = 10_000;
-const READS_MAX = 3_000_000;
+const READS_SAFE = 3_000_000;
+const READS_MAX = 5_000_000;
 const clampReads = (v) => Math.max(READS_MIN, Math.min(READS_MAX, Math.floor(Number(v) || 0)));
+const readsWarn = document.getElementById("readsWarn");
+
+function updateReadsState(v) {
+  const over = v > READS_SAFE;
+  els.maxReadsSlider.classList.toggle("over-limit", over);
+  if (readsWarn) readsWarn.classList.toggle("hide", !over);
+}
 
 let selectedFile = null;
 let rpc = sylphWorkerRpc();
@@ -123,26 +131,37 @@ function selectFile(f) {
 }
 
 function updateMemHint(n) {
-  els.memHint.textContent = `~${(n / 1_000_000 * 360).toFixed(0)} MB peak browser memory at ${n.toLocaleString()} reads.`;
+  // Rough planning estimate only — assumes ~150 bp single-end Illumina reads
+  // (~360 B per FASTQ record), plus ~600 MB baseline for the database, sketches,
+  // wasm module and working buffers. Long reads or paired-end can multiply the
+  // per-read figure 2–3× or more.
+  const ramGB = (n * 360 + 600 * 1024 * 1024) / (1024 ** 3);
+  els.memHint.textContent =
+    `Rough estimate: ≳${ramGB.toFixed(1)} GB peak browser memory at ${n.toLocaleString()} reads ` +
+    `(assumes short single-end reads; long or paired reads can use 2–3× more).`;
 }
 
 els.maxReadsSlider.addEventListener("input", () => {
   const v = Number(els.maxReadsSlider.value);
   els.maxReads.value = String(v);
   updateMemHint(v);
+  updateReadsState(v);
 });
 els.maxReads.addEventListener("input", () => {
   const raw = Number(els.maxReads.value);
   if (!Number.isFinite(raw)) return;
   els.maxReadsSlider.value = String(Math.max(READS_MIN, Math.min(READS_MAX, raw)));
   updateMemHint(raw > 0 ? raw : 1);
+  updateReadsState(raw);
 });
 els.maxReads.addEventListener("change", () => {
   const v = clampReads(els.maxReads.value);
   els.maxReads.value = String(v);
   els.maxReadsSlider.value = String(v);
   updateMemHint(v);
+  updateReadsState(v);
 });
+updateReadsState(Number(els.maxReads.value));
 
 // ---- run -----------------------------------------------------------------------
 
