@@ -25,15 +25,14 @@ In-browser gut metagenomic profiling: a WebAssembly build of [sylph](https://git
 
 ## Database hosting
 
-The 6 MB smoke-test database (`web/db/gut_mini.syldb`) is bundled with the site. The full 433 MB UHGG `gut.syldb` is too large for GitHub Pages and is fetched from a **GitHub Release** at runtime (`releases/download/db-v1/gut.syldb`). To publish a new DB:
+The 6 MB smoke-test database (`web/db/gut_mini.syldb`) is bundled with the site. The full 433 MB UHGG `gut.syldb` is too large for GitHub Pages and is fetched from **Zenodo** at runtime:
 
-```bash
-gh release create db-v1 web/db/gut.syldb \
-  --title "UHGG gut DB v1" \
-  --notes "Full UHGG gut .syldb consumed at runtime by the in-browser sylph profiler."
-```
+- DOI: [10.5281/zenodo.20180025](https://doi.org/10.5281/zenodo.20180025)
+- File URL (CORS-enabled, used by the web app): `https://zenodo.org/api/records/20180025/files/gut.syldb/content`
 
-If you use a different tag, update the two `<option value="…">` lines in `web/profile.html` and `web/multi.html`.
+> Note: the user-facing record URL `https://zenodo.org/records/20180025/files/gut.syldb` does **not** return CORS headers, so it can't be `fetch()`-ed by the browser app. Use the `/api/records/.../content` form instead. GitHub Release assets have the same CORS limitation — that's why we host on Zenodo rather than from a GitHub Release.
+
+To publish a new version, upload a fresh `gut.syldb` to Zenodo and swap the URL in the two `<option value="…">` lines in `web/index.html` and `web/profile.html`.
 
 ## Citations
 
