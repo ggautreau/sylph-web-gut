@@ -60,28 +60,45 @@ self.addEventListener("message", async (e) => {
     } else if (type === "profileFile") {
       if (!profiler) throw new Error("database not loaded");
       const { file, maxReads } = e.data;
+      const trimT0 = performance.now();
       const trimmed = await readAndTrim(file, maxReads,
         (bytesIn, reads, total) => self.postMessage({ id, progress: { bytesIn, reads, total } }),
         ac.signal,
       );
+      const trimMs = performance.now() - trimT0;
+      console.log(`[worker profileFile] trim done: reads=${trimmed.reads} (target ${maxReads}) ` +
+        `bytes=${trimmed.bytes.length} compressedRead=${trimmed.compressedBytesRead ?? '?'} ` +
+        `fileSize=${file.size} in ${trimMs.toFixed(0)} ms`);
+      self.postMessage({ id, progress: { phase: "profile_start", reads: trimmed.reads } });
       const t0 = performance.now();
       const tsv = profiler.profile(trimmed.bytes, maxReads);
       const elapsedMs = performance.now() - t0;
+      console.log(`[worker profileFile] profile done in ${elapsedMs.toFixed(0)} ms; ` +
+        `tsv has ${(tsv.match(/\n/g) || []).length} lines`);
       self.postMessage({ id, ok: true, tsv, elapsedMs, reads: trimmed.reads });
     } else if (type === "profileFilesMulti") {
       if (!profiler) throw new Error("database not loaded");
       const { files, maxReads } = e.data;
+      const trimT0 = performance.now();
       const trimmed = await readAndTrimMulti(files, maxReads,
         (bytesIn, reads, total, fi) => self.postMessage({ id, progress: { bytesIn, reads, total, fi } }),
         ac.signal,
       );
+      const trimMs = performance.now() - trimT0;
+      console.log(`[worker profileFilesMulti] trim done: reads=${trimmed.reads} (target ${maxReads}) ` +
+        `bytes=${trimmed.bytes.length} totalFileSize=${files.reduce((a, f) => a + f.size, 0)} ` +
+        `in ${trimMs.toFixed(0)} ms`);
+      self.postMessage({ id, progress: { phase: "profile_start", reads: trimmed.reads } });
       const t0 = performance.now();
       const tsv = profiler.profile(trimmed.bytes, maxReads);
       const elapsedMs = performance.now() - t0;
+      console.log(`[worker profileFilesMulti] profile done in ${elapsedMs.toFixed(0)} ms; ` +
+        `tsv has ${(tsv.match(/\n/g) || []).length} lines`);
       self.postMessage({ id, ok: true, tsv, elapsedMs, reads: trimmed.reads });
     } else if (type === "profileFilesPe") {
       if (!profiler) throw new Error("database not loaded");
       const { r1Files, r2Files, maxReads } = e.data;
+      const trimT0 = performance.now();
       const [t1, t2] = await Promise.all([
         readAndTrimMulti(r1Files, maxReads,
           (b, r, t, fi) => self.postMessage({ id, progress: { mate: 1, bytesIn: b, reads: r, total: t, fi } }),
@@ -90,9 +107,15 @@ self.addEventListener("message", async (e) => {
           (b, r, t, fi) => self.postMessage({ id, progress: { mate: 2, bytesIn: b, reads: r, total: t, fi } }),
           ac.signal),
       ]);
+      const trimMs = performance.now() - trimT0;
+      console.log(`[worker profileFilesPe] trim done: r1=${t1.reads}/${t1.bytes.length}B ` +
+        `r2=${t2.reads}/${t2.bytes.length}B target ${maxReads} in ${trimMs.toFixed(0)} ms`);
+      self.postMessage({ id, progress: { phase: "profile_start", reads: Math.min(t1.reads, t2.reads) } });
       const t0 = performance.now();
       const tsv = profiler.profile_pe(t1.bytes, t2.bytes, maxReads);
       const elapsedMs = performance.now() - t0;
+      console.log(`[worker profileFilesPe] profile done in ${elapsedMs.toFixed(0)} ms; ` +
+        `tsv has ${(tsv.match(/\n/g) || []).length} lines`);
       self.postMessage({ id, ok: true, tsv, elapsedMs, reads: Math.min(t1.reads, t2.reads) });
     } else {
       throw new Error(`unknown message type: ${type}`);

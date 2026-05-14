@@ -328,11 +328,19 @@ async function runAll() {
     paintOverall(i, files.length, 0);
 
     const t0 = performance.now();
+    let wasmTick = null;
     try {
       let tsv;
+      function startWasmHeartbeat(label, reads) {
+        const wasmT0 = performance.now();
+        wasmTick = setInterval(() => {
+          const sec = ((performance.now() - wasmT0) / 1000).toFixed(1);
+          s.progress = `sketching ${reads.toLocaleString()} ${label} in WASM worker (${sec} s)`;
+          renderFilesList();
+          setStep(`[${i + 1}/${files.length}] ${s.sampleName} — WASM compute, ${sec} s`);
+        }, 250);
+      }
       if (s.kind === "pe") {
-        // Worker does decompression + trim + profile for both mates; main
-        // thread just relays progress.
         const r1Files = s.peRuns.map(p => p.r1);
         const r2Files = s.peRuns.map(p => p.r2);
         const total1 = r1Files.reduce((a, f) => a + f.size, 0);
@@ -340,6 +348,7 @@ async function runAll() {
         let p1 = { bytesIn: 0, reads: 0, fi: 0 };
         let p2 = { bytesIn: 0, reads: 0, fi: 0 };
         ({ tsv } = await rpc.profileFilesPe(r1Files, r2Files, maxReads, (p) => {
+          if (p.phase === "profile_start") { startWasmHeartbeat("pairs", p.reads); return; }
           if (p.mate === 1) p1 = { bytesIn: p.bytesIn, reads: p.reads, fi: p.fi };
           else p2 = { bytesIn: p.bytesIn, reads: p.reads, fi: p.fi };
           const reads = Math.min(p1.reads, p2.reads);
@@ -356,6 +365,7 @@ async function runAll() {
         const seFiles = s.seRuns;
         const totalBytes = seFiles.reduce((a, f) => a + f.size, 0);
         ({ tsv } = await rpc.profileFilesMulti(seFiles, maxReads, (p) => {
+          if (p.phase === "profile_start") { startWasmHeartbeat("reads", p.reads); return; }
           s.progress =
             `${p.reads.toLocaleString()} reads, file ${p.fi + 1}/${seFiles.length} ` +
             `(${fmtBytes(p.bytesIn)} / ${fmtBytes(totalBytes)} total)`;
@@ -384,6 +394,7 @@ async function runAll() {
       }
       console.error(e);
     } finally {
+      if (wasmTick) { clearInterval(wasmTick); wasmTick = null; }
       renderFilesList();
       paintOverall(i + 1, files.length, 0);
     }

@@ -13,7 +13,7 @@
 
 // Bump this version when you change the worker or any module it imports,
 // to force the browser to refetch instead of reusing its module-worker cache.
-const WORKER_VERSION = "3";
+const WORKER_VERSION = "5";
 
 export function sylphWorkerRpc() {
   const workerUrl = new URL(`./sylph-worker.js?v=${WORKER_VERSION}`, import.meta.url);

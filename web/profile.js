@@ -179,15 +179,29 @@ async function run() {
   setStep("decompressing + trimming to first N reads…");
 
   let lastReadsSeen = 0;
+  let wasmTick = null;
   try {
     // The worker now does decompression + trim + profile end-to-end. Main
     // thread keeps no read buffer; we just relay progress events to the UI.
     const { tsv, reads, elapsedMs } = await rpc.profileFile(
       selectedFile, maxReads,
-      ({ bytesIn, reads: r, total }) => {
-        lastReadsSeen = r;
-        const pct = total > 0 ? Math.min(100, (bytesIn / total) * 100) : 0;
-        paintProgress(pct, bytesIn, total, r, maxReads, t0);
+      (p) => {
+        if (p.phase === "profile_start") {
+          // Worker just handed the trimmed bytes to sylph. The wasm call is
+          // synchronous in the worker — drive a heartbeat from the main
+          // thread so the user sees the elapsed counter moving.
+          paintProgress(100, selectedFile.size, selectedFile.size, p.reads, maxReads, t0);
+          const wasmT0 = performance.now();
+          wasmTick = setInterval(() => {
+            const sec = ((performance.now() - wasmT0) / 1000).toFixed(1);
+            setStep(`sketching + profiling ${p.reads.toLocaleString()} reads in WASM worker (${sec} s)`);
+            els.elapsed.textContent = `${((performance.now() - t0) / 1000).toFixed(1)} s`;
+          }, 250);
+          return;
+        }
+        lastReadsSeen = p.reads;
+        const pct = p.total > 0 ? Math.min(100, (p.bytesIn / p.total) * 100) : 0;
+        paintProgress(pct, p.bytesIn, p.total, p.reads, maxReads, t0);
         setStep("decompressing + trimming to first N reads in worker…");
       },
     );
@@ -198,6 +212,7 @@ async function run() {
     showError(`${e.message ?? e}\n\nCheck DevTools console for details.`);
     console.error(e);
   } finally {
+    if (wasmTick) clearInterval(wasmTick);
     els.run.disabled = false;
   }
 }
