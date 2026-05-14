@@ -178,29 +178,22 @@ async function run() {
   const t0 = performance.now();
   setStep("decompressing + trimming to first N reads…");
 
+  let lastReadsSeen = 0;
   try {
-    const trimmed = await readAndTrim(selectedFile, maxReads, (bytesIn, reads, totalBytes) => {
-      const pct = totalBytes > 0 ? Math.min(100, (bytesIn / totalBytes) * 100) : 0;
-      paintProgress(pct, bytesIn, totalBytes, reads, maxReads, t0);
-    });
-    paintProgress(100, trimmed.compressedBytesRead, selectedFile.size, trimmed.reads, maxReads, t0);
-
-    // Heartbeat while the worker computes — the main thread stays responsive
-    // and the user sees a moving counter rather than a frozen UI.
-    const wasmT0 = performance.now();
-    const tick = setInterval(() => {
-      const sec = ((performance.now() - wasmT0) / 1000).toFixed(1);
-      setStep(`sketching + profiling ${trimmed.reads.toLocaleString()} reads in WASM worker (${sec} s)`);
-      els.elapsed.textContent = `${((performance.now() - t0) / 1000).toFixed(1)} s`;
-    }, 250);
-    let tsv;
-    try {
-      ({ tsv } = await rpc.profile(trimmed.bytes, maxReads));
-    } finally {
-      clearInterval(tick);
-    }
+    // The worker now does decompression + trim + profile end-to-end. Main
+    // thread keeps no read buffer; we just relay progress events to the UI.
+    const { tsv, reads, elapsedMs } = await rpc.profileFile(
+      selectedFile, maxReads,
+      ({ bytesIn, reads: r, total }) => {
+        lastReadsSeen = r;
+        const pct = total > 0 ? Math.min(100, (bytesIn / total) * 100) : 0;
+        paintProgress(pct, bytesIn, total, r, maxReads, t0);
+        setStep("decompressing + trimming to first N reads in worker…");
+      },
+    );
+    paintProgress(100, selectedFile.size, selectedFile.size, reads ?? lastReadsSeen, maxReads, t0);
     renderResults(tsv);
-    setStep(`done in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+    setStep(`done in ${((performance.now() - t0) / 1000).toFixed(1)} s (worker ${(elapsedMs / 1000).toFixed(1)} s)`);
   } catch (e) {
     showError(`${e.message ?? e}\n\nCheck DevTools console for details.`);
     console.error(e);
@@ -209,75 +202,9 @@ async function run() {
   }
 }
 
-// ---- streaming: gunzip + cut at first 4*N newlines -----------------------------
-
-async function readAndTrim(file, maxReads, onProgress) {
-  const isGz = await detectGzip(file);
-  const targetNewlines = maxReads * 4;
-  const totalBytes = file.size;
-
-  let compressedBytesRead = 0;
-  const tap = new TransformStream({
-    transform(chunk, controller) {
-      compressedBytesRead += chunk.length;
-      controller.enqueue(chunk);
-    },
-  });
-
-  let stream = file.stream().pipeThrough(tap);
-  if (isGz) stream = stream.pipeThrough(new DecompressionStream("gzip"));
-
-  // Accumulate decompressed bytes up to (4 * maxReads) newlines.
-  const reader = stream.getReader();
-  const parts = [];
-  let totalOut = 0;
-  let newlines = 0;
-  let lastReport = 0;
-
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-
-    let cutoff = -1;
-    for (let i = 0; i < value.length; i++) {
-      if (value[i] === 0x0A) {
-        newlines++;
-        if (newlines === targetNewlines) {
-          cutoff = i + 1;
-          break;
-        }
-      }
-    }
-    if (cutoff >= 0) {
-      parts.push(value.subarray(0, cutoff));
-      totalOut += cutoff;
-      await reader.cancel();
-      break;
-    }
-    parts.push(value);
-    totalOut += value.length;
-
-    const now = performance.now();
-    if (now - lastReport > 100) {
-      onProgress(compressedBytesRead, Math.floor(newlines / 4), totalBytes);
-      lastReport = now;
-    }
-  }
-
-  // One big Uint8Array — easier on wasm-bindgen than many tiny chunks.
-  const bytes = new Uint8Array(totalOut);
-  let off = 0;
-  for (const p of parts) {
-    bytes.set(p, off);
-    off += p.length;
-  }
-  return { bytes, reads: Math.floor(newlines / 4), compressedBytesRead };
-}
-
-async function detectGzip(file) {
-  const head = new Uint8Array(await file.slice(0, 2).arrayBuffer());
-  return head.length === 2 && head[0] === 0x1f && head[1] === 0x8b;
-}
+// Streaming decompression + trim now lives in the worker (see fastq-trim.js
+// and sylph-worker.js). Main thread just sends the File handle to the worker
+// and consumes progress events.
 
 // ---- output rendering ----------------------------------------------------------
 

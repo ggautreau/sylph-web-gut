@@ -1,47 +1,55 @@
-// Web Worker that owns the WASM Profiler.
-//
-// The DB is held in the worker's WASM linear memory so the main thread is free
-// to keep painting progress, gunzipping the next FASTQ, etc. while a sample is
-// being profiled. Messages are RPC-style: each request has an `id`, the reply
-// echoes it.
+// Web Worker that owns the WASM Profiler and now also does FASTQ decompression
+// + trim, so the main thread never holds the uncompressed read buffer.
 //
 // Protocol (every message has `id` + `type`):
 //   in  { id, type: "init" }
 //   out { id, ok: true }
 //   in  { id, type: "loadDb", bytes: Uint8Array }    // bytes is transferred
 //   out { id, ok: true, meta: { database_size, k, c, bytes } }
-//   in  { id, type: "profile", fastq: Uint8Array, maxReads: number }   // transferred
-//   out { id, ok: true, tsv, elapsedMs }
+//   in  { id, type: "profileFile", file: File, maxReads }
+//   in  { id, type: "profileFilesMulti", files: File[], maxReads }
+//   in  { id, type: "profileFilesPe", r1Files: File[], r2Files: File[], maxReads }
+//       progress: { id, progress: { ... } }   // emitted periodically
+//   out { id, ok: true, tsv, elapsedMs, reads }
+//   in  { id: 0, type: "cancel", target: <id-being-cancelled> }   // abort an in-flight op
 //   error: { id, ok: false, error: string }
 
 import init, { Profiler } from "./sylph-pkg/sylph_wasm.js";
+import { readAndTrim, readAndTrimMulti } from "./fastq-trim.js";
 
 let profiler = null;
 let inited = false;
 
+// id -> AbortController, so "cancel" messages can interrupt readAndTrim*.
+const aborters = new Map();
+
+function ensureInited() {
+  if (inited) return Promise.resolve();
+  return init().then(() => { inited = true; });
+}
+
 self.addEventListener("message", async (e) => {
   const { id, type } = e.data;
+
+  if (type === "cancel") {
+    const ac = aborters.get(e.data.target);
+    if (ac) ac.abort();
+    return;
+  }
+
+  const ac = new AbortController();
+  aborters.set(id, ac);
   try {
     if (type === "init") {
-      if (!inited) {
-        await init();
-        inited = true;
-      }
+      await ensureInited();
       self.postMessage({ id, ok: true });
     } else if (type === "loadDb") {
-      if (!inited) {
-        await init();
-        inited = true;
-      }
-      if (profiler) {
-        profiler.free();
-        profiler = null;
-      }
+      await ensureInited();
+      if (profiler) { profiler.free(); profiler = null; }
       const { bytes } = e.data;
       profiler = new Profiler(bytes);
       self.postMessage({
-        id,
-        ok: true,
+        id, ok: true,
         meta: {
           database_size: profiler.database_size,
           k: profiler.k,
@@ -49,24 +57,49 @@ self.addEventListener("message", async (e) => {
           bytes: bytes.length,
         },
       });
-    } else if (type === "profile") {
+    } else if (type === "profileFile") {
       if (!profiler) throw new Error("database not loaded");
-      const { fastq, maxReads } = e.data;
+      const { file, maxReads } = e.data;
+      const trimmed = await readAndTrim(file, maxReads,
+        (bytesIn, reads, total) => self.postMessage({ id, progress: { bytesIn, reads, total } }),
+        ac.signal,
+      );
       const t0 = performance.now();
-      const tsv = profiler.profile(fastq, maxReads);
+      const tsv = profiler.profile(trimmed.bytes, maxReads);
       const elapsedMs = performance.now() - t0;
-      self.postMessage({ id, ok: true, tsv, elapsedMs });
-    } else if (type === "profilePe") {
+      self.postMessage({ id, ok: true, tsv, elapsedMs, reads: trimmed.reads });
+    } else if (type === "profileFilesMulti") {
       if (!profiler) throw new Error("database not loaded");
-      const { r1, r2, maxReads } = e.data;
+      const { files, maxReads } = e.data;
+      const trimmed = await readAndTrimMulti(files, maxReads,
+        (bytesIn, reads, total, fi) => self.postMessage({ id, progress: { bytesIn, reads, total, fi } }),
+        ac.signal,
+      );
       const t0 = performance.now();
-      const tsv = profiler.profile_pe(r1, r2, maxReads);
+      const tsv = profiler.profile(trimmed.bytes, maxReads);
       const elapsedMs = performance.now() - t0;
-      self.postMessage({ id, ok: true, tsv, elapsedMs });
+      self.postMessage({ id, ok: true, tsv, elapsedMs, reads: trimmed.reads });
+    } else if (type === "profileFilesPe") {
+      if (!profiler) throw new Error("database not loaded");
+      const { r1Files, r2Files, maxReads } = e.data;
+      const [t1, t2] = await Promise.all([
+        readAndTrimMulti(r1Files, maxReads,
+          (b, r, t, fi) => self.postMessage({ id, progress: { mate: 1, bytesIn: b, reads: r, total: t, fi } }),
+          ac.signal),
+        readAndTrimMulti(r2Files, maxReads,
+          (b, r, t, fi) => self.postMessage({ id, progress: { mate: 2, bytesIn: b, reads: r, total: t, fi } }),
+          ac.signal),
+      ]);
+      const t0 = performance.now();
+      const tsv = profiler.profile_pe(t1.bytes, t2.bytes, maxReads);
+      const elapsedMs = performance.now() - t0;
+      self.postMessage({ id, ok: true, tsv, elapsedMs, reads: Math.min(t1.reads, t2.reads) });
     } else {
       throw new Error(`unknown message type: ${type}`);
     }
   } catch (err) {
     self.postMessage({ id, ok: false, error: err?.message ?? String(err) });
+  } finally {
+    aborters.delete(id);
   }
 });

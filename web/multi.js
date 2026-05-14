@@ -331,65 +331,38 @@ async function runAll() {
     try {
       let tsv;
       if (s.kind === "pe") {
-        // Concatenate all R1 streams (and all R2 streams) across the sample's
-        // paired runs into a single stream each, cap at maxReads pairs total.
+        // Worker does decompression + trim + profile for both mates; main
+        // thread just relays progress.
         const r1Files = s.peRuns.map(p => p.r1);
         const r2Files = s.peRuns.map(p => p.r2);
-        let p1 = { bytesIn: 0, reads: 0, total: r1Files.reduce((a, f) => a + f.size, 0), fi: 0 };
-        let p2 = { bytesIn: 0, reads: 0, total: r2Files.reduce((a, f) => a + f.size, 0), fi: 0 };
-        const repaint = () => {
+        const total1 = r1Files.reduce((a, f) => a + f.size, 0);
+        const total2 = r2Files.reduce((a, f) => a + f.size, 0);
+        let p1 = { bytesIn: 0, reads: 0, fi: 0 };
+        let p2 = { bytesIn: 0, reads: 0, fi: 0 };
+        ({ tsv } = await rpc.profileFilesPe(r1Files, r2Files, maxReads, (p) => {
+          if (p.mate === 1) p1 = { bytesIn: p.bytesIn, reads: p.reads, fi: p.fi };
+          else p2 = { bytesIn: p.bytesIn, reads: p.reads, fi: p.fi };
           const reads = Math.min(p1.reads, p2.reads);
           s.progress =
             `${reads.toLocaleString()} pairs across ${r1Files.length} run${r1Files.length === 1 ? "" : "s"}; ` +
-            `R1 file ${p1.fi + 1}/${r1Files.length} ${fmtBytes(p1.bytesIn)}/${fmtBytes(p1.total)}, ` +
-            `R2 file ${p2.fi + 1}/${r2Files.length} ${fmtBytes(p2.bytesIn)}/${fmtBytes(p2.total)}`;
+            `R1 file ${p1.fi + 1}/${r1Files.length} ${fmtBytes(p1.bytesIn)}/${fmtBytes(total1)}, ` +
+            `R2 file ${p2.fi + 1}/${r2Files.length} ${fmtBytes(p2.bytesIn)}/${fmtBytes(total2)}`;
           renderFilesList();
           paintOverall(i, files.length,
-            ((p1.bytesIn + p2.bytesIn) / Math.max(1, p1.total + p2.total))
-          );
-        };
-        const [tr1, tr2] = await Promise.all([
-          readAndTrimMulti(r1Files, maxReads, abortCtrl.signal, (b, r, t, fi) => {
-            p1 = { bytesIn: b, reads: r, total: t, fi }; repaint();
-          }),
-          readAndTrimMulti(r2Files, maxReads, abortCtrl.signal, (b, r, t, fi) => {
-            p2 = { bytesIn: b, reads: r, total: t, fi }; repaint();
-          }),
-        ]);
-        const wasmT0 = performance.now();
-        const tick = setInterval(() => {
-          const sec = ((performance.now() - wasmT0) / 1000).toFixed(1);
-          s.progress = `sketching ${tr1.reads.toLocaleString()} pairs in WASM worker (${sec} s)`;
-          renderFilesList();
-          setStep(`[${i + 1}/${files.length}] ${s.sampleName} — WASM compute (PE), ${sec} s`);
-        }, 250);
-        try {
-          ({ tsv } = await rpc.profilePe(tr1.bytes, tr2.bytes, maxReads));
-        } finally {
-          clearInterval(tick);
-        }
+            (p1.bytesIn + p2.bytesIn) / Math.max(1, total1 + total2));
+          setStep(`[${i + 1}/${files.length}] ${s.sampleName} — decompress + sketch (PE)`);
+        }, abortCtrl.signal));
       } else {
         const seFiles = s.seRuns;
         const totalBytes = seFiles.reduce((a, f) => a + f.size, 0);
-        const trimmed = await readAndTrimMulti(seFiles, maxReads, abortCtrl.signal,
-          (bytesIn, reads, _total, fi) => {
-            s.progress =
-              `${reads.toLocaleString()} reads, file ${fi + 1}/${seFiles.length} (${fmtBytes(bytesIn)} / ${fmtBytes(totalBytes)} total)`;
-            renderFilesList();
-            paintOverall(i, files.length, totalBytes > 0 ? bytesIn / totalBytes : 0);
-          });
-        const wasmT0 = performance.now();
-        const tick = setInterval(() => {
-          const sec = ((performance.now() - wasmT0) / 1000).toFixed(1);
-          s.progress = `sketching ${trimmed.reads.toLocaleString()} reads in WASM worker (${sec} s)`;
+        ({ tsv } = await rpc.profileFilesMulti(seFiles, maxReads, (p) => {
+          s.progress =
+            `${p.reads.toLocaleString()} reads, file ${p.fi + 1}/${seFiles.length} ` +
+            `(${fmtBytes(p.bytesIn)} / ${fmtBytes(totalBytes)} total)`;
           renderFilesList();
-          setStep(`[${i + 1}/${files.length}] ${s.sampleName} — WASM compute, ${sec} s`);
-        }, 250);
-        try {
-          ({ tsv } = await rpc.profile(trimmed.bytes, maxReads));
-        } finally {
-          clearInterval(tick);
-        }
+          paintOverall(i, files.length, totalBytes > 0 ? p.bytesIn / totalBytes : 0);
+          setStep(`[${i + 1}/${files.length}] ${s.sampleName} — decompress + sketch`);
+        }, abortCtrl.signal));
       }
 
       const rows = parseTsv(tsv);
@@ -433,77 +406,9 @@ function mergeRowsIntoMatrix(matrix, sampleName, rows) {
   }
 }
 
-// ---- streaming gunzip + read cap, across one or many input files -----------
-//
-// `readAndTrimMulti` consumes the files in order: it walks through each one,
-// gunzipping if it has the gzip magic, counting newlines across the *concatenated*
-// stream of records, and stops as soon as 4 × maxReads newlines have been emitted.
-// If the cap is hit mid-file, later files in the list are not read at all.
-
-async function readAndTrimMulti(filesList, maxReads, signal, onProgress) {
-  const targetNewlines = maxReads * 4;
-  const parts = [];
-  let totalOut = 0;
-  let newlines = 0;
-  let bytesIn = 0;
-  let lastReport = 0;
-  const totalBytes = filesList.reduce((a, f) => a + f.size, 0);
-
-  outer: for (let fi = 0; fi < filesList.length; fi++) {
-    if (signal.aborted) throw new DOMException("aborted", "AbortError");
-    const f = filesList[fi];
-    const isGz = await detectGzip(f);
-    const tap = new TransformStream({
-      transform(chunk, controller) { bytesIn += chunk.length; controller.enqueue(chunk); },
-    });
-    let stream = f.stream().pipeThrough(tap);
-    if (isGz) stream = stream.pipeThrough(new DecompressionStream("gzip"));
-
-    const reader = stream.getReader();
-    const onAbort = () => reader.cancel().catch(() => {});
-    signal.addEventListener("abort", onAbort);
-    try {
-      while (true) {
-        if (signal.aborted) throw new DOMException("aborted", "AbortError");
-        const { value, done } = await reader.read();
-        if (done) break;
-        let cutoff = -1;
-        for (let i = 0; i < value.length; i++) {
-          if (value[i] === 0x0A) {
-            newlines++;
-            if (newlines === targetNewlines) { cutoff = i + 1; break; }
-          }
-        }
-        if (cutoff >= 0) {
-          parts.push(value.subarray(0, cutoff));
-          totalOut += cutoff;
-          await reader.cancel();
-          break outer;
-        }
-        parts.push(value);
-        totalOut += value.length;
-        const now = performance.now();
-        if (now - lastReport > 100) {
-          onProgress(bytesIn, Math.floor(newlines / 4), totalBytes, fi);
-          lastReport = now;
-        }
-      }
-    } finally {
-      signal.removeEventListener("abort", onAbort);
-    }
-    // file fully consumed — onto the next
-  }
-
-  const bytes = new Uint8Array(totalOut);
-  let off = 0;
-  for (const p of parts) { bytes.set(p, off); off += p.length; }
-  return { bytes, reads: Math.floor(newlines / 4) };
-}
-
-async function detectGzip(file) {
-  const head = new Uint8Array(await file.slice(0, 2).arrayBuffer());
-  return head.length === 2 && head[0] === 0x1f && head[1] === 0x8b;
-}
+// Streaming decompression + trim across one or many input files now lives in
+// the worker (see fastq-trim.js and sylph-worker.js). Main thread just ships
+// File handles via rpc.profileFilesMulti / profileFilesPe and relays progress.
 
 // ---- TSV parsing + matrix assembly -------------------------------------------
 
